@@ -1,0 +1,157 @@
+# Версия синтаксиса Docker Compose. 
+version: '3.8'
+
+# Используем YAML якоря (anchors) для создания базового шаблона 'x-airflow-base',
+# чтобы избежать дублирования кода и определить общие настройки для всех сервисов Airflow.
+x-airflow-base: &airflow-base
+  # Указываем, что образ для этого сервиса нужно собрать локально.
+  build:
+    # 'context: .' указываем, что Docker должен использовать текущую директорию как контекст сборки.
+    context: .
+    # Указываем имя Dockerfile, который будет использоваться для сборки.
+    dockerfile: Dockerfile
+  # Переменные окружения, которые будут доступны внутри контейнера.
+  # Они будут использованы для конфигурации самого Airflow.
+  environment:
+    # Устанавливаем ID пользователя внутри контейнера, чтобы избежать проблем с правами доступа к файлам в volumes.
+    - AIRFLOW_UID=${AIRFLOW_UID:-50000}
+    # Определяем тип исполнителя задач в Airflow. LocalExecutor будет выполнять задачи в отдельных процессах на той же машине.
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    # Строка подключения к базе данных метаданных Airflow. 
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    # Отключаем загрузку примеров DAG'ов, которые идут с Airflow по умолчанию.
+    - AIRFLOW__CORE__LOAD_EXAMPLES=false
+  # Пробрасываем локальные папки внутрь контейнера, чтобы редактировать код локально.
+  # Airflow сразу увидит изменения без необходимости пересборки образа.
+  volumes:
+    - ./dags:/opt/airflow/dags         # Папка с DAG-файлами
+    - ./data:/opt/airflow/data         # Папка с исходными данными (parquet-файлы)
+    - ./logs:/opt/airflow/logs         # Папка для логов выполнения задач
+    - ./plugins:/opt/airflow/plugins   # Папка для плагинов Airflow
+    - ./scripts:/opt/airflow/scripts   # Папка со скриптами (например, init.sql)
+  # Устанавливаем зависимость запуска. Этот сервис начнет запускаться только после того,
+  # как сервис 'postgres' пройдет healthcheck.
+  depends_on:
+    postgres:
+      condition: service_healthy
+  # Подключаем сервис к общей сети, чтобы контейнеры могли общаться друг с другом по именам.
+  networks:
+    - project-network
+
+# Блок, в котором определяются все контейнеры.
+services:
+  # Сервис базы данных PostgreSQL.
+  postgres:
+    # Используем официальный образ PostgreSQL версии 13.
+    image: postgres:13
+    # Задаем кастомное имя контейнера для удобства.
+    container_name: project_postgres
+    # Переменные окружения для настройки PostgreSQL. Значения берутся из файла .env.
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    # Настройка хранения данных.
+    volumes:
+      # Именованный volume 'postgres-data' для постоянного хранения данных БД. Данные не удалятся при перезапуске контейнера.
+      - postgres-data:/var/lib/postgresql/data
+      # Пробрасываем наш init.sql в специальную директорию. Скрипты из этой папки выполняются один раз при первом запуске контейнера.
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    # Проброс портов. Позволяет подключаться к БД извне контейнеров по адресу localhost:5433.
+    ports:
+      - "5433:5432"
+    # Проверка состояния сервиса. Docker будет периодически выполнять эту команду.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - project-network
+
+  # Сервис для веб-интерфейса pgAdmin.
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: project_pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@example.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    ports:
+      - "5050:80" # pgAdmin будет доступен по адресу http://localhost:5050
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - project-network
+
+  # Сервис для инициализации базы данных Airflow.
+  airflow-init:
+    # '<<: *airflow-base' - YAML-алиас. Он вставляет сюда все настройки из шаблона 'airflow-base'.
+    <<: *airflow-base
+    container_name: project_airflow_init
+    # Переопределяем точку входа, чтобы выполнить bash-скрипт.
+    entrypoint: /bin/bash
+    # Команда, которая будет выполнена.
+    command:
+      - -c
+      - |
+        set -e
+        # Функция для проверки, существует ли уже пользователь 'admin'.
+        user_exists() {
+            airflow users list 2>/dev/null | grep -c "admin"
+        }
+        echo "Upgrading metadata database..."
+        # Выполняем миграции для создания/обновления таблиц в БД Airflow.
+        airflow db upgrade
+        # Создаем пользователя 'admin' только если он еще не существует.
+        if [ "$$(user_exists)" -eq 0 ]; then
+            echo "Creating admin user..."
+            airflow users create \
+                --username admin \
+                --password admin \
+                --firstname Admin \
+                --lastname User \
+                --role Admin \
+                --email admin@example.com
+        else
+            echo "Admin user already exists."
+        fi
+
+  # Сервис веб-сервера Airflow (пользовательский интерфейс).
+  airflow-webserver:
+    <<: *airflow-base
+    container_name: project_airflow_webserver
+    # Команда для запуска веб-сервера.
+    command: webserver
+    ports:
+      - "8081:8080" # UI Airflow будет доступен по адресу http://localhost:8081
+    # Запустится только после того, как сервис 'airflow-init' успешно завершил свою работу.
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Сервис планировщика Airflow. Он будет отвечать за запуск DAG'ов по расписанию.
+  airflow-scheduler:
+    <<: *airflow-base
+    container_name: project_airflow_scheduler
+    # Команда для запуска планировщика.
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+# Определяем именованные volumes, которые будут использоватся в секции 'services'.
+volumes:
+  # Этот volume будет управляться Docker и использоваться для хранения данных PostgreSQL.
+  postgres-data:
+
+# Определяем сети, которые будут использоватся в секции 'services'.
+networks:
+  # Создаем кастомную сеть типа 'bridge'.
+  project-network:
+    driver: bridge
